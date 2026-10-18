@@ -7,10 +7,6 @@ using Fulfillment.Infrastructure.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System;
-using System.Diagnostics.Eventing.Reader;
-using System.Management.Instrumentation;
-using System.Net;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -23,7 +19,9 @@ public class OrdersController : ControllerBase
     private readonly FulfillmentDbContext _context;
     private readonly ILogger<OrdersController> _logger;
 
-    public OrdersController(FulfillmentDbContext context, ILogger<OrdersController> logger)
+    public OrdersController(
+        FulfillmentDbContext context,
+        ILogger<OrdersController> logger)
     {
         _context = context;
         _logger = logger;
@@ -33,7 +31,9 @@ public class OrdersController : ControllerBase
     [ProducesResponseType(typeof(OrderResponse), StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
-    public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request, CancellationToken ct)
+    public async Task<IActionResult> CreateOrder(
+        [FromBody] CreateOrderRequest request,
+        CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.CustomerOrderNumber))
             return BadRequest("Customer order number is required.");
@@ -41,7 +41,8 @@ public class OrdersController : ControllerBase
         if (request.Items == null || request.Items.Count == 0)
             return BadRequest("Order must contain at least one item.");
 
-        var exists = await _context.Orders.AnyAsync(o => o.CustomerOrderNumber == request.CustomerOrderNumber.Trim().ToUpperInvariant(), ct);
+        var exists = await _context.Orders
+            .AnyAsync(o => o.CustomerOrderNumber == request.CustomerOrderNumber.Trim().ToUpperInvariant(), ct);
 
         if (exists)
             return Conflict($"Order '{request.CustomerOrderNumber}' already exists.");
@@ -49,12 +50,11 @@ public class OrdersController : ControllerBase
         var order = new Order(request.CustomerOrderNumber);
 
         var productIds = request.Items.Select(i => i.ProductId).Distinct().ToList();
-
         var products = await _context.Products
             .Where(p => productIds.Contains(p.Id) && p.IsActive)
             .ToDictionaryAsync(p => p.Id, ct);
-         
-        if(products.Count != productIds.Count)
+
+        if (products.Count != productIds.Count)
             return BadRequest("One or more products specified in the order do not exist or are inactive.");
 
         foreach (var item in request.Items)
@@ -72,10 +72,12 @@ public class OrdersController : ControllerBase
             order.ToResponse());
     }
 
-    [HttpGet("{id:guid")]
+    [HttpGet("{id:guid}")]
     [ProducesResponseType(typeof(OrderResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async EventTask<IActionResult> GetById([FromRoute] Guid id, CancellationToken ct)
+    public async Task<IActionResult> GetById(
+        [FromRoute] Guid id,
+        CancellationToken ct)
     {
         var order = await _context.Orders
             .Include(o => o.Items)
@@ -90,10 +92,12 @@ public class OrdersController : ControllerBase
 
     [HttpPost("{id:guid}/allocate")]
     [ProducesResponseType(typeof(OrderResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
-    [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    public async ManagementTaskAttribute<IActionResult> AllocateOrder([FromRoute] Guid id, CancellationToken ct)
+    public async Task<IActionResult> AllocateOrder(
+        [FromRoute] Guid id,
+        CancellationToken ct)
     {
         await using var transaction = await _context.Database.BeginTransactionAsync(ct);
 
@@ -109,33 +113,45 @@ public class OrdersController : ControllerBase
             if (order.Status != OrderStatus.Pending)
                 return BadRequest($"Order cannot be allocated. Current status is '{order.Status}'.");
 
-            foreach (var bin in inventoryBins)
+            foreach (var lineItem in order.Items)
             {
-                if (bin.QuantityAvailable <= 0)
-                    continue;
+                var inventoryBins = await _context.InventoryItems
+                    .Where(i => i.ProductId == lineItem.ProductId)
+                    .ToListAsync(ct);
 
-                int allocateAmount = Math.Min(bin.QuantityAvailable, remainingNeeded);
-                bin.AllocateStock(allocateAmount);
-                remainingNeeded -= allocateAmount;
+                int remainingNeeded = lineItem.Quantity;
 
-                if (remainingNeeded == 0)
-                    break;
+                foreach (var bin in inventoryBins)
+                {
+                    if (bin.QuantityAvailable <= 0)
+                        continue;
+
+                    int allocateAmount = Math.Min(bin.QuantityAvailable, remainingNeeded);
+                    bin.AllocateStock(allocateAmount);
+                    remainingNeeded -= allocateAmount;
+
+                    if (remainingNeeded == 0)
+                        break;
+                }
 
                 if (remainingNeeded > 0)
                 {
-                    throw new DomainValidationException($"Insufficient stock for Product ID '{lineItem.ProductId}'. Unfulfilled deficit: {remainingNeeded} units.");
+                    throw new DomainValidationException(
+                        $"Insufficient stock for Product ID '{lineItem.ProductId}'. Unfulfilled deficit: {remainingNeeded} units.");
                 }
             }
 
             order.MarkAllocated();
+
             await _context.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
+
             return Ok(order.ToResponse());
         }
         catch (DbUpdateConcurrencyException ex)
         {
             await transaction.RollbackAsync(ct);
-            _logger.LogWarning(ex, "Concurrency conflict occurred while allocating order with ID '{OrderId}'.", id);
+            _logger.LogWarning(ex, "Concurrency collision detected while allocating order {OrderId}.", id);
 
             return Conflict(new ProblemDetails
             {
@@ -145,10 +161,22 @@ public class OrdersController : ControllerBase
                 Instance = HttpContext.Request.Path
             });
         }
+        catch (DomainValidationException ex)
+        {
+            await transaction.RollbackAsync(ct);
+
+            return BadRequest(new ProblemDetails
+            {
+                Status = StatusCodes.Status400BadRequest,
+                Title = "Allocation Rule Violation",
+                Detail = ex.Message,
+                Instance = HttpContext.Request.Path
+            });
+        }
         catch (Exception ex)
         {
             await transaction.RollbackAsync(ct);
-            _logger.LogError(ex, "Unexpected error occurred while allocating order with ID '{OrderId}'.", id);
+            _logger.LogError(ex, "Unexpected error occurred during order allocation {OrderId}.", id);
             throw;
         }
     }
