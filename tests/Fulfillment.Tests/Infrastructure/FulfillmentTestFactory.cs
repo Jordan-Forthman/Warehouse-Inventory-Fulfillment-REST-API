@@ -3,9 +3,6 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using System;
-using System.Runtime.Remoting.Channels;
-using System.Threading.Tasks;
 
 namespace Fulfillment.Tests.Infrastructure;
 
@@ -15,6 +12,7 @@ public class FulfillmentTestFactory : WebApplicationFactory<Program>
     {
         builder.ConfigureServices(services =>
         {
+            // Locate existing DbContext registration
             var descriptor = services.SingleOrDefault(
                 d => d.ServiceType == typeof(DbContextOptions<FulfillmentDbContext>));
 
@@ -23,18 +21,21 @@ public class FulfillmentTestFactory : WebApplicationFactory<Program>
                 services.Remove(descriptor);
             }
 
+            // Register test database configuration
             services.AddDbContext<FulfillmentDbContext>(options =>
             {
-                options.UseSqlServer("Server=localhost\\SQLEXPRESS;Database=FulfillmentTestDb;Trusted_Connection=True;TrustServerCertificate=True");
+                // Connect to local SQL Server test database
+                options.UseSqlServer("Server=localhost\\SQLEXPRESS;Database=WarehouseFulfillmentTestDb;Trusted_Connection=True;TrustServerCertificate=True;");
             });
         });
     }
 
     public async Task InitializeDatabaseAsync()
     {
-        using var scope = ChannelServices.CreateScope();
+        using var scope = Services.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<FulfillmentDbContext>();
 
+        // Ensure test database exists and applies latest schema
         await context.Database.EnsureDeletedAsync();
         await context.Database.MigrateAsync();
     }
